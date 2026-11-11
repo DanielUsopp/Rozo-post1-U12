@@ -6,12 +6,16 @@ import com.empresa.reembolsos.infraestructura.RepositorioSolicitudesJpa;
 import com.empresa.reembolsos.procesamiento.calculo.SelectorCalculadora;
 import com.empresa.reembolsos.procesamiento.notificacion.ObservadorCambioEstado;
 import com.empresa.reembolsos.procesamiento.validacion.CadenaValidadores;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
 
 @Service
 public class SolicitudReembolsoService {
+    private static final Logger log = LoggerFactory.getLogger(SolicitudReembolsoService.class);
+
     private final CadenaValidadores validadores;
     private final SelectorCalculadora calculadoras;
     private final List<ObservadorCambioEstado> observadores;
@@ -42,7 +46,18 @@ public class SolicitudReembolsoService {
         var estadoAnterior = solicitud.getEstado();
         solicitud.setEstado(nuevoEstado);
         var guardada = repositorio.save(solicitud);
-        observadores.forEach(o -> o.onCambioEstado(guardada, estadoAnterior));
+        observadores.forEach(o -> notificarSinInterrumpir(o, guardada, estadoAnterior));
         return guardada;
+    }
+
+    // Un observador que falla no debe impedir que los demas se enteren (ADR-001)
+    private void notificarSinInterrumpir(ObservadorCambioEstado observador, SolicitudReembolso solicitud,
+                                         EstadoSolicitud estadoAnterior) {
+        try {
+            observador.onCambioEstado(solicitud, estadoAnterior);
+        } catch (RuntimeException e) {
+            log.error("{} fallo al procesar el cambio de estado de la solicitud {}",
+                observador.getClass().getSimpleName(), solicitud.getId(), e);
+        }
     }
 }

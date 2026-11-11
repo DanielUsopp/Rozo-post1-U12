@@ -85,4 +85,19 @@ class SolicitudReembolsoServiceTest {
                 () -> servicio.cambiarEstado(77L, EstadoSolicitud.APROBADA));
         verifyNoInteractions(observadorA, observadorB);
     }
+
+    @Test
+    void cambiarEstado_unObservadorFalla_losDemasIgualSeEnteran() {
+        SolicitudReembolso existente = conDocumentos(CategoriaGasto.CAPACITACION, "1000000", 0);
+        existente.setEstado(EstadoSolicitud.PENDIENTE);
+        when(repositorio.findById(5L)).thenReturn(Optional.of(existente));
+        doThrow(new IllegalStateException("API de Contabilidad no disponible"))
+                .when(observadorA).onCambioEstado(any(), any());
+
+        SolicitudReembolso resultado = servicio.cambiarEstado(5L, EstadoSolicitud.APROBADA);
+
+        assertEquals(EstadoSolicitud.APROBADA, resultado.getEstado());
+        verify(repositorio).save(existente);
+        verify(observadorB).onCambioEstado(existente, EstadoSolicitud.PENDIENTE);
+    }
 }
