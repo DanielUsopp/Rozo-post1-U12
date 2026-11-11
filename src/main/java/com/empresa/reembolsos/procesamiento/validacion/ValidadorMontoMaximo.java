@@ -10,6 +10,7 @@ import java.util.Map;
 
 @Component
 public class ValidadorMontoMaximo extends ValidadorSolicitud {
+    // Para VIAJE el valor es diario: el tope real depende de los dias del viaje (RF2)
     private static final Map<CategoriaGasto, BigDecimal> TOPES = Map.of(
         CategoriaGasto.VIAJE, new BigDecimal("150000"),
         CategoriaGasto.REPRESENTACION, new BigDecimal("2000000"),
@@ -17,9 +18,17 @@ public class ValidadorMontoMaximo extends ValidadorSolicitud {
 
     @Override
     protected ResultadoValidacion validarPropio(SolicitudReembolso solicitud, List<SolicitudReembolso> pendientes) {
-        var tope = TOPES.get(solicitud.getCategoria());
+        var tope = topeDe(solicitud);
         return solicitud.getMontoSolicitado().compareTo(tope) > 0
             ? ResultadoValidacion.rechazar("Monto excede el tope de la categoria " + solicitud.getCategoria())
             : ResultadoValidacion.ok();
+    }
+
+    private BigDecimal topeDe(SolicitudReembolso solicitud) {
+        var tope = TOPES.get(solicitud.getCategoria());
+        if (solicitud.getCategoria() == CategoriaGasto.VIAJE) {
+            return tope.multiply(BigDecimal.valueOf(solicitud.getDiasViaje()));
+        }
+        return tope;
     }
 }
