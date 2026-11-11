@@ -19,6 +19,57 @@ Esta sección se escribió a partir de los tres requisitos funcionales, antes de
 
 **Cómo encajan los tres.** Cada patrón resuelve un problema que los otros dos no resuelven, y se conectan sin adaptadores: la cadena entrega un `ResultadoValidacion`; si es válido, la estrategia de la categoría produce el monto aprobado; y cuando la solicitud cambia de estado, el `SolicitudReembolsoService` anuncia el cambio a los observadores. El servicio de aplicación es el único punto que conoce a los tres y al repositorio.
 
+## Decisiones de diseño — Parte 1
+
+### Decisión de diseño 1 — Orden de la cadena: documentos → monto → duplicados
+Los validadores se encadenaron del más barato al más costoso. `ValidadorDocumentosSoporte` revisa un booleano y `ValidadorMontoMaximo` hace una comparación contra un tope fijo; los dos responden en tiempo constante. `ValidadorDuplicados` recorre la lista de solicitudes pendientes del empleado, y esa lista además exige una consulta a la base de datos antes de entrar a la cadena. Al ponerlo al final, una solicitud sin soporte o con un monto fuera de rango se rechaza sin llegar a recorrer esa lista.
+
+- **Lo que se gana.** Las solicitudes con errores evidentes se resuelven con el trabajo mínimo, y el eslabón caro solo trabaja para solicitudes que ya pasaron las dos verificaciones baratas.
+- **Lo que se pierde.** El empleado recibe un motivo a la vez: si le faltan documentos y además está duplicada, primero se entera de los documentos y, al corregirlos, recién se entera del duplicado (`CadenaValidadoresTest.validar_variosProblemasALaVez_reportaElPrimeroDeLaCadena` lo demuestra). Con el orden inverso pasaría lo mismo, pero con el costo de consultar los duplicados en cada solicitud.
+- **Matiz honesto.** En la implementación actual el servicio carga los pendientes antes de llamar a la cadena, así que la consulta a la base de datos se hace siempre; lo que el orden ahorra es el recorrido de la lista. Si el volumen lo justificara, el siguiente paso sería cargar los pendientes solo cuando la cadena llegue al último eslabón.
+
+### Decisión de diseño 2 — Selección por un `Map` construido desde la `List<CalculadoraReembolso>`
+Se eligió el mapa que arma `SelectorCalculadora` a partir de todas las `CalculadoraReembolso` que Spring encuentra, y no un `switch` sobre `CategoriaGasto`. El RF2 dice que Finanzas agregará categorías "sin modificar el cálculo de las categorías existentes". Con el mapa, agregar "bienestar" es crear `CalculadoraBienestar` con `@Component` y agregar la constante al enum; ninguna línea de `SelectorCalculadora` ni de las calculadoras existentes cambia. Con un `switch`, cada categoría nueva obligaría a editar el método de selección: el mismo `switch` que se eliminó en la Unidad 11.
+
+Además, `Collectors.toMap` lanza `IllegalStateException` si dos calculadoras declaran la misma categoría, así que ese error de configuración aparece al arrancar la aplicación y no en medio de una solicitud (`SelectorCalculadoraTest.constructor_dosCalculadorasParaLaMismaCategoria_fallaAlConstruir`).
+
+## Hallazgos al probar el flujo
+Al ejercitar el flujo completo con solicitudes reales aparecieron dos defectos en el código de partida. Se corrigieron en un commit aparte (`fix: calcular el tope de viaticos por dia y comparar duplicados por mes y año`):
+
+1. **El tope de viáticos no consideraba los días.** `ValidadorMontoMaximo` comparaba toda solicitud de VIAJE contra 150.000, que en el RF2 es el tope *diario*. Un viaje de 3 días por 400.000, que `CalculadoraViaje` aprobaría completo (tope 450.000), se rechazaba en la validación con "Monto excede el tope de la categoria VIAJE". Ahora el validador usa 150.000 × días para VIAJE.
+2. **El período de duplicados ignoraba el año.** `ValidadorDuplicados` comparaba `getMonth()`, así que una solicitud pendiente de noviembre de 2025 bloqueaba una nueva de noviembre de 2026. Ahora compara `YearMonth` (mes y año).
+
+Queda una observación sin cambiar porque no rompe nada: para REPRESENTACION y CAPACITACION, el validador rechaza todo monto por encima del tope, así que el `min(tope)` de esas calculadoras nunca llega a recortar un monto. Funciona como una segunda barrera.
+
+## Evidencia de funcionamiento
+Respuestas reales de la aplicación (`java -jar`, H2 en memoria):
+
+```
+POST /api/solicitudes  REPRESENTACION 1.800.000          -> 200  montoAprobado 1800000, estado PENDIENTE
+POST /api/solicitudes  CAPACITACION 2.500.000            -> 200  montoAprobado 2000000.0 (80 %)
+POST /api/solicitudes  VIAJE 90.000 sin documentos       -> 400  {"motivo":"Faltan documentos soporte"}
+PUT  /api/solicitudes/1/estado "APROBADA"                -> 200  estado APROBADA
+PUT  /api/solicitudes/2/estado "REQUIERE_CORRECCION"     -> 200  estado REQUIERE_CORRECCION
+PUT  /api/solicitudes/99/estado "APROBADA"               -> 404  {"motivo":"Solicitud no encontrada: 99"}
+```
+Salida de los observadores para esos dos cambios de estado (Contabilidad solo reacciona a la aprobación):
+```
+Notificando a E-201: su solicitud paso de PENDIENTE a APROBADA
+Contabilidad: programar pago de 1800000.00 para E-201
+Auditoria: solicitud 1 cambio de PENDIENTE a APROBADA
+Notificando a E-201: su solicitud paso de PENDIENTE a REQUIERE_CORRECCION
+Auditoria: solicitud 2 cambio de PENDIENTE a REQUIERE_CORRECCION
+```
+
+## Pruebas
+`mvn verify`: 37 pruebas, 0 fallos.
+- **Unitarias (31):**
+  - Validadores: 2 + 7 + 3, más 3 de la cadena completa.
+  - Calculadoras: 3 + 2 + 2, más 3 del selector.
+  - `NotificadorContabilidad`: 2.
+  - `SolicitudReembolsoService` con repositorio y observadores simulados: 4.
+- **Integración (6), `ReembolsosFlujoCompletoTest` (`@SpringBootTest` + MockMvc):** creación de las tres categorías, rechazo sin documentos, cambio a APROBADA verificando con `@SpyBean` que los tres notificadores recibieron el aviso, y 404 para un id inexistente.
+
 ## Estructura de paquetes
 ```
 src/main/java/com/empresa/reembolsos/
