@@ -118,16 +118,86 @@ Para cada elemento se aplicó el criterio de la Guía (sección 4.2): ¿la varia
 - **Por qué se descartó:** el contrato de esa API no existe todavía. Cualquier interfaz escrita hoy sería una adivinanza sobre sus parámetros, su autenticación y su manejo de errores, y lo más probable es que haya que reescribirla cuando llegue el contrato real. `ObservadorCambioEstado` ya permite cambiar el interior de `NotificadorContabilidad` sin tocar nada más; lo único que sí se adelantó es lo que se sabe con certeza, que una API externa puede fallar (ver ADR-001).
 - **Señal para reconsiderar:** la publicación de la especificación de la API, o que otro módulo además de la notificación necesite hablar con Contabilidad.
 
-## Estructura de paquetes
+## Arquitectura resultante
+Arquitectura en capas simples, con los tres patrones de comportamiento concentrados en `procesamiento` y un único punto de coordinación:
+
+```
+                    HTTP
+                     │
+          adaptadores/rest  ── SolicitudReembolsoController, ManejadorExcepcionesApi
+                     │ solo usa
+                aplicacion  ── SolicitudReembolsoService (único que conoce los tres patrones y el repositorio)
+        ┌────────────┼──────────────┬────────────────────┐
+        ▼            ▼              ▼                    ▼
+ procesamiento/  procesamiento/  procesamiento/   infraestructura
+ validacion      calculo         notificacion     RepositorioSolicitudesJpa
+ (CoR)           (Strategy)      (Observer)        (Spring Data JPA + META-INF/orm.xml)
+        └────────────┴──────────────┴────────────────────┘
+                                  │ todos dependen de
+                               dominio  ── SolicitudReembolso, CategoriaGasto, EstadoSolicitud
+```
+
 ```
 src/main/java/com/empresa/reembolsos/
 ├── ReembolsosApplication.java
 ├── dominio/                 SolicitudReembolso, CategoriaGasto, EstadoSolicitud (sin Spring ni JPA)
 ├── procesamiento/
-│   ├── validacion/          RF1 — Chain of Responsibility
-│   ├── calculo/             RF2 — Strategy
-│   └── notificacion/        RF3 — Observer
-├── aplicacion/              SolicitudReembolsoService
+│   ├── validacion/          RF1 — ValidadorSolicitud, 3 validadores, CadenaValidadores, ResultadoValidacion
+│   ├── calculo/             RF2 — CalculadoraReembolso, 3 calculadoras, SelectorCalculadora
+│   └── notificacion/        RF3 — ObservadorCambioEstado, 3 notificadores
+├── aplicacion/              SolicitudReembolsoService y sus excepciones
 ├── infraestructura/         RepositorioSolicitudesJpa
-└── adaptadores/rest/        SolicitudReembolsoController
+└── adaptadores/rest/        SolicitudReembolsoController, ManejadorExcepcionesApi
 ```
+
+Los límites que se ven en el diagrama están verificados con ArchUnit en cada push:
+- `procesamiento` no conoce `infraestructura` ni `adaptadores` (Regla 1).
+- El controlador solo llega a `aplicacion` y `dominio` (Regla 2).
+- Cada calculadora y cada notificador implementa su interfaz (Reglas 3 y 4).
+
+El dominio no tiene anotaciones de Spring ni de JPA; su mapeo a la tabla `solicitud_reembolso` está en `src/main/resources/META-INF/orm.xml`.
+
+**Respuestas HTTP.** `ManejadorExcepcionesApi` traduce `SolicitudInvalidaException` (la cadena rechazó la solicitud) a **400** y `SolicitudNoEncontradaException` a **404**, ambos con el motivo en `{"motivo": ...}`. El servicio del enunciado lanzaba `IllegalArgumentException` para una solicitud inexistente; se creó `SolicitudNoEncontradaException`, que extiende esa misma clase, para poder responder 404 sin confundirla con una categoría no soportada (400).
+
+## Evidencia del pipeline
+| Ejecución | Commit | Resultado | Qué muestra |
+|-----------|--------|-----------|-------------|
+| [#1](https://github.com/DanielUsopp/Rozo-post1-U12/actions/runs/43112548338) | `ci: agregar workflow de GitHub Actions...` | Success | Las 4 reglas y las 38 pruebas en verde |
+| [#2](https://github.com/DanielUsopp/Rozo-post1-U12/actions/runs/43112874632) | `test: violacion de arquitectura intencional` | **Failure** | Falla el paso "Ejecutar reglas de arquitectura" y la suite completa ni se ejecuta |
+| [#3](https://github.com/DanielUsopp/Rozo-post1-U12/actions/runs/43112964591) | `Revert "test: violacion de arquitectura intencional"` | Success | El pipeline vuelve a verde tras el revert |
+
+La violación intencional fue el atajo más tentador del proyecto: inyectar `RepositorioSolicitudesJpa` en `ValidadorDuplicados` para que consultara los pendientes por su cuenta. Compila y todas las pruebas de negocio pasan, pero ArchUnit lo detecta:
+
+```
+Architecture Violation [Priority: MEDIUM] - Rule 'no classes that reside in a package '..procesamiento..'
+should depend on classes that reside in any package ['..infraestructura..', '..adaptadores..',
+'org.springframework.data..', 'jakarta.persistence..']' was violated (1 times):
+Field <com.empresa.reembolsos.procesamiento.validacion.ValidadorDuplicados.repositorio> has type
+<com.empresa.reembolsos.infraestructura.RepositorioSolicitudesJpa> in (ValidadorDuplicados.java:0)
+```
+
+Se usó un campo y no solo un `import`, porque un `import` que no se usa no queda en el bytecode y ArchUnit, que analiza clases compiladas, no lo vería.
+
+![Historial de GitHub Actions con el build fallido y el build en verde](capturas/historial-pipeline.png)
+![Detalle del build fallido por la Regla 1](capturas/build-fallido-regla1.png)
+
+## Cómo ejecutar
+```bash
+./mvnw spring-boot:run                      # API en http://localhost:8080/api/solicitudes
+./mvnw verify                               # 38 pruebas (unitarias + integración)
+./mvnw test -Dtest=ReglasArquitectura       # 4 reglas de arquitectura
+```
+Ejemplo de solicitud:
+```bash
+curl -X POST http://localhost:8080/api/solicitudes -H "Content-Type: application/json" \
+  -d '{"empleadoId":"E-201","categoria":"VIAJE","montoSolicitado":400000,"fechaGasto":"2026-11-03","diasViaje":3,"documentosSoporte":true}'
+curl -X PUT http://localhost:8080/api/solicitudes/1/estado -H "Content-Type: application/json" -d '"APROBADA"'
+```
+
+## Herramientas utilizadas
+- Java 17, Spring Boot 3.3 (Web, Data JPA), H2
+- JUnit 5, Mockito, MockMvc, ArchUnit 1.2.1
+- Apache Maven, GitHub Actions, Git, GitHub
+
+## Conclusiones
+Escribir el diseño propuesto antes del código obligó a justificar cada patrón con el punto de variabilidad concreto del requisito, y por eso los tres patrones terminaron resolviendo problemas distintos sin necesitar adaptadores entre ellos. Probar el flujo completo con datos realistas fue lo que sacó a la luz los dos defectos del código de partida, el tope de viáticos sin días y los duplicados sin año, algo que las pruebas unitarias aisladas no habrían mostrado. En la Parte 2, la decisión más útil no fue agregar arquitectura sino evaluar cada dependencia por separado: la persistencia no tenía ningún cambio previsto y se dejó en capas simples, mientras que la notificación sí tenía un cambio anunciado y lo que necesitaba no era una interfaz nueva, sino que el fallo de un interesado no dejara sin aviso a los demás. ArchUnit en el pipeline convirtió esos límites en algo que se verifica en cada push, como mostró el build que falló con la violación intencional.
